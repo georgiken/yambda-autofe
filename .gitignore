@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+results/**/events_*.parquet
+results/events_*.parquet
+results/synthetic/
+data/
