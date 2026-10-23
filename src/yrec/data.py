@@ -66,9 +66,10 @@ def load_raw_events(path: str, n_users: int | None = None, seed: int = 0) -> pd.
         uniq = np.unique(uids.to_numpy())
         rng = np.random.default_rng(seed)
         keep = rng.choice(uniq, size=min(n_users, len(uniq)), replace=False)
-        tbl = pq.read_table(path, columns=cols, filters=[("uid", "in", keep.tolist())])
+        tbl = pq.read_table(path, columns=cols, filters=[("uid", "in", keep.tolist())],
+                            read_dictionary=["event_type"])
     else:
-        tbl = pq.read_table(path, columns=cols)
+        tbl = pq.read_table(path, columns=cols, read_dictionary=["event_type"])
     return tbl.to_pandas()
 
 
@@ -82,9 +83,13 @@ def prepare_events(raw: pd.DataFrame, artist_map: pd.DataFrame | None = None,
     ev["day"] = (ev["ts"] // TS_PER_DAY).astype("int16")
     ev["organic"] = raw["is_organic"].astype("int8").to_numpy()
     et = raw["event_type"]
-    if not np.issubdtype(np.asarray(et).dtype, np.integer):
-        et = pd.Series(np.asarray(et).astype(str)).map(EVENT_CODES)
-    ev["etype"] = np.asarray(et).astype("int8")
+    if isinstance(et.dtype, pd.CategoricalDtype):
+        lut = np.array([EVENT_CODES[str(c)] for c in et.cat.categories], dtype="int8")
+        ev["etype"] = lut[et.cat.codes.to_numpy()]
+    elif np.issubdtype(np.asarray(et).dtype, np.integer):
+        ev["etype"] = np.asarray(et).astype("int8")
+    else:
+        ev["etype"] = pd.Series(np.asarray(et).astype(str)).map(EVENT_CODES).to_numpy().astype("int8")
     ev["ratio"] = pd.to_numeric(raw["played_ratio_pct"], errors="coerce").astype("float32").to_numpy()
     ev["tlen"] = pd.to_numeric(raw["track_length_seconds"], errors="coerce").astype("float32").to_numpy()
     for name, m in (("artist", artist_map), ("album", album_map)):

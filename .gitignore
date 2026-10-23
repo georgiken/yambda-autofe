@@ -5,3 +5,4 @@ results/**/events_*.parquet
 results/events_*.parquet
 results/synthetic/
 data/
+*.tar.gz
