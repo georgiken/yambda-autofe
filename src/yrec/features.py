@@ -23,6 +23,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .data import TS_PER_DAY
+
 DAY_BITS = 1024  # composite key = key * 1024 + day  (day must be < 1024)
 SHIFT = np.int64(1 << 24)
 
@@ -213,7 +215,7 @@ class FeatureEngine:
     Leakage-safety: lookups only ever read cumulative state at day <= d-1."""
 
     def __init__(self, ev: pd.DataFrame, entities: Iterable[str] = tuple(ENTITIES)):
-        assert ev["day"].max() < DAY_BITS
+        assert ev["day"].max() < DAY_BITS, "time span must be < 1024 days"
         self._memo = {}
         st = event_stats(ev)
         day = ev["day"].to_numpy()
@@ -278,7 +280,7 @@ class FeatureEngine:
 # --------------------------------------------------------------------------- context & session
 def context_features(tgt: pd.DataFrame) -> pd.DataFrame:
     """Known-at-request-time context: hour of day (UTC proxy), weekday proxy, track length."""
-    tod = (tgt["ts"].to_numpy() % 17280) / 720.0
+    tod = (tgt["ts"].to_numpy() % TS_PER_DAY) / 3600.0
     return pd.DataFrame({"ctx_hour": tod.astype("float32"),
                          "ctx_dow": (tgt["day"].to_numpy() % 7).astype("float32"),
                          "item_tlen": tgt["tlen"].to_numpy().astype("float32")}, index=tgt.index)

@@ -4,7 +4,7 @@ Unified event table (one row per event) after `prepare_events`:
     uid      int64
     item_id  int64
     ts       int64   # Yambda timestamp, 5-second bins
-    day      int16   # ts // 17280 (relative day index)
+    day      int16   # ts // 86400 (relative day index)
     organic  int8    # 1 = organic, 0 = recommendation-driven
     etype    int8    # 0 listen, 1 like, 2 dislike, 3 unlike, 4 undislike
     ratio    float32 # played_ratio_pct (listens only, NaN otherwise)
@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-TS_PER_DAY = 17280  # 86400 s / 5 s bins
+TS_PER_DAY = 86400  # Yambda timestamps are seconds (rounded to 5 s): 50m spans ~300 days
 EVENT_CODES = {"listen": 0, "like": 1, "dislike": 2, "unlike": 3, "undislike": 4}
 HF_REPO = "yandex/yambda"
 
@@ -81,6 +81,7 @@ def prepare_events(raw: pd.DataFrame, artist_map: pd.DataFrame | None = None,
         "ts": raw["timestamp"].astype("int64").to_numpy(),
     })
     ev["day"] = (ev["ts"] // TS_PER_DAY).astype("int16")
+    assert ev["day"].max() < 1024, f"unexpected time span: {ev['day'].max()} days (check timestamp units)"
     ev["organic"] = raw["is_organic"].astype("int8").to_numpy()
     et = raw["event_type"]
     if isinstance(et.dtype, pd.CategoricalDtype):
@@ -110,7 +111,9 @@ def load_yambda(data_dir: str | None = None, size: str = "50m", n_users: int | N
     """End-to-end loader. data_dir: folder with already downloaded files (Kaggle dataset)
     using HF layout; if None, downloads from HuggingFace."""
     if cache and os.path.exists(cache):
-        return pd.read_parquet(cache)
+        ev = pd.read_parquet(cache)
+        ev["day"] = (ev["ts"] // TS_PER_DAY).astype("int16")  # recompute: cache may predate a units fix
+        return ev
     if data_dir is not None:
         d = Path(data_dir)
         cand = list(d.rglob(f"flat/{size}/multi_event.parquet")) or list(d.rglob("multi_event.parquet"))
