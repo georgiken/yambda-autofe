@@ -9,3 +9,6 @@ data/
 results_smoke/
 .venv/
 yambda-autofe.zip
+results/**/preds_test.npz
+results1/
+results.zip
