@@ -65,7 +65,7 @@ class AutoFEResult:
 
 def run_autofe(engine: FeatureEngine, tr: pd.DataFrame, va: pd.DataFrame, extra_tr: pd.DataFrame | None = None,
                extra_va: pd.DataFrame | None = None, k_per_family: int = 2, max_corr: float = 0.97,
-               n_grid=(10, 20, 30, 45, 60, 80, 100, 150), fixed_n: int | None = None,
+               n_grid=(10, 20, 30, 45, 60, 80, 100), fixed_n: int | None = None, max_n: int = 100,
                gbdt_params: dict | None = None, verbose: bool = True) -> AutoFEResult:
     """tr/va: target frames (with 'label'); extra_*: fixed feature blocks always included in stage 2
     (e.g. context / session), so AutoFE selects features that add value on top of them."""
@@ -110,7 +110,7 @@ def run_autofe(engine: FeatureEngine, tr: pd.DataFrame, va: pd.DataFrame, extra_
     m = GBDT(gbdt_params).fit(Xtr, ytr, Xva, yva)
     imp = m.importance()
     ranking = [f for f in imp.index if f not in fixed_cols]
-    grid = sorted({n for n in n_grid if n < len(ranking)} | {len(ranking)})
+    grid = sorted({n for n in n_grid if n < len(ranking)} | {min(len(ranking), max_n)})
     if fixed_n is not None:
         grid = [min(fixed_n, len(ranking))]
     curve = []

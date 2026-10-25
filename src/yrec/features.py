@@ -118,18 +118,18 @@ class _EntityStore:
         comp = keys[m] * DAY_BITS + day[m].astype("int64")
         uniq, inv = np.unique(comp, return_inverse=True)
         self.comp = uniq
-        self.key = uniq // DAY_BITS
-        self.day = (uniq % DAY_BITS).astype("int64")
+        key = uniq // DAY_BITS
+        self.day = (uniq % DAY_BITS).astype(np.int16)
         n = len(uniq)
         self.daily = {s: np.bincount(inv, weights=stats[s].to_numpy()[m], minlength=n).astype("float32")
                       for s in stats.columns}
         # key-start index for each row -> to make cumsums restart per key
         newkey = np.ones(n, dtype=bool)
-        newkey[1:] = self.key[1:] != self.key[:-1]
-        self.start = np.maximum.accumulate(np.where(newkey, np.arange(n), 0)).astype(np.int64)
-        self.day = self.day.astype(np.int16)
+        newkey[1:] = key[1:] != key[:-1]
+        del key, inv, comp
+        self.start = np.maximum.accumulate(np.where(newkey, np.arange(n), 0)).astype(np.int32)
         self._cum: OrderedDict = OrderedDict()
-        self.max_decay_cache = 12
+        self.max_decay_cache = 4
         self._last: dict = {}
         self.d0 = DAY_BITS / 2  # fixed reference -> decay sums depend only on the past (and stay in float64 range)
 
@@ -149,11 +149,17 @@ class _EntityStore:
         if h is not None:
             x = x * np.exp2((self.day - self.d0) / h)
         c = self._cumsum(x)
+        if h is None:
+            c = c.astype(np.float32)  # window sums: per-key counts < 2^24 are exact in float32; halves memory
         self._cum[k] = c
         dk = [kk for kk in self._cum if kk[1] is not None]
         if len(dk) > self.max_decay_cache:
             self._cum.pop(dk[0])
         return c
+
+    def clear(self):
+        self._cum.clear()
+        self._last.clear()
 
     def locate(self, q_key: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Index of the last row with same key and day <= t; valid mask."""
@@ -161,7 +167,7 @@ class _EntityStore:
         posc = np.clip(pos, 0, max(len(self.comp) - 1, 0))
         valid = (pos >= 0) & (q_key >= 0) & (len(self.comp) > 0)
         if len(self.comp):
-            valid &= self.key[posc] == q_key
+            valid &= (self.comp[posc] // DAY_BITS) == q_key
         return posc, valid
 
     def loc(self, q_key, d, off, memo=None):
@@ -195,7 +201,7 @@ class _EntityStore:
             return np.where(v, self.day[p], np.nan)
         if stat not in self._last:
             m = self.daily[stat] > 0
-            self._last[stat] = (self.comp[m], self.key[m], self.day[m])
+            self._last[stat] = (self.comp[m], self.comp[m] // DAY_BITS, self.day[m])
         comp, key, day = self._last[stat]
         pos = np.searchsorted(comp, q_key * DAY_BITS + (d - 1), side="right") - 1
         posc = np.clip(pos, 0, max(len(comp) - 1, 0))
@@ -219,9 +225,16 @@ class FeatureEngine:
         self._memo = {}
         st = event_stats(ev)
         day = ev["day"].to_numpy()
-        self.stores = {e: _EntityStore(entity_key(ev, e), day, st) for e in entities}
+        self.stores = {}
+        for e in entities:
+            self.stores[e] = _EntityStore(entity_key(ev, e), day, st)
+        del st
 
-    _memo: dict = {}
+    def clear_cache(self):
+        """Drop per-frame memo and cumulative caches (they are rebuilt lazily on demand)."""
+        self._memo.clear()
+        for st in self.stores.values():
+            st.clear()
 
     def _ctx(self, tgt: pd.DataFrame, entity: str):
         """Per-target-frame memo of keys and searchsorted positions (huge speed-up when many

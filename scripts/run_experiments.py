@@ -7,6 +7,7 @@ Example (Kaggle):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -24,8 +25,16 @@ from yrec.model import GBDT, configure  # noqa: E402
 from yrec.protocol import evaluate, group_id, make_split, make_targets  # noqa: E402
 
 
+def rss_gb() -> float:
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2  # Linux: KB -> GB (peak)
+    except Exception:
+        return float("nan")
+
+
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+    print(time.strftime("%H:%M:%S"), f"[peak {rss_gb():.1f}GB]", *a, flush=True)
 
 
 def main():
@@ -38,7 +47,7 @@ def main():
     ap.add_argument("--n-train", type=int, default=21)
     ap.add_argument("--n-val", type=int, default=7)
     ap.add_argument("--n-test", type=int, default=7)
-    ap.add_argument("--max-train-rows", type=int, default=3_000_000)
+    ap.add_argument("--max-train-rows", type=int, default=1_500_000)
     ap.add_argument("--autofe-train-rows", type=int, default=400_000)
     ap.add_argument("--autofe-val-rows", type=int, default=300_000)
     ap.add_argument("--skip-autofe", action="store_true")
@@ -89,11 +98,20 @@ def main():
     ctx = {k: context_features(df) for k, df in (("tr", tr), ("va", va), ("te", te))}
     sess = {k: session_features(ev, df) for k, df in (("tr", tr), ("va", va), ("te", te))}
     timings["session_s"] = time.time() - t
+    # AutoFE samples need the raw log for session features -> build them now, then free the raw log
+    if not a.skip_autofe:
+        tr_s = make_targets(ev, sp.train_days, a.autofe_train_rows, seed=a.seed + 1)
+        va_s = make_targets(ev, sp.val_days, a.autofe_val_rows, seed=a.seed + 1)
+        extra_tr = pd.concat([context_features(tr_s), session_features(ev, tr_s)], axis=1)
+        extra_va = pd.concat([context_features(va_s), session_features(ev, va_s)], axis=1)
+    del ev
+    gc.collect()
+    log("raw event log released")
 
     def block(specs: list[FeatureSpec]):
         t0 = time.time()
         out = {k: eng.frame(specs, df) for k, df in (("tr", tr), ("va", va), ("te", te))}
-        eng._memo.clear()
+        eng.clear_cache()
         return out, time.time() - t0
 
     def run(name, blocks, params=None, save_importance=False):
@@ -130,18 +148,17 @@ def main():
     run("manual", [man, ctx])
     run("manual+sess", [man, ctx, sess], save_importance=True)
     run("manual+sess_lambdarank", [man, ctx, sess], params={"objective": "lambdarank"})
+    del man
+    gc.collect()
 
     if a.skip_autofe:
         return
 
     # ------------------------------------------------------------------ AutoFE (search on train/val samples only)
-    tr_s = make_targets(ev, sp.train_days, a.autofe_train_rows, seed=a.seed + 1)
-    va_s = make_targets(ev, sp.val_days, a.autofe_val_rows, seed=a.seed + 1)
-    extra_tr = pd.concat([context_features(tr_s), session_features(ev, tr_s)], axis=1)
-    extra_va = pd.concat([context_features(va_s), session_features(ev, va_s)], axis=1)
+    eng.clear_cache()
     t = time.time()
     res = run_autofe(eng, tr_s, va_s, extra_tr, extra_va,
-                     n_grid=(10, 30) if a.smoke else (10, 20, 30, 45, 60, 80, 100, 150))
+                     n_grid=(10, 30) if a.smoke else (10, 20, 30, 45, 60, 80, 100))
     timings["autofe_search_s"] = time.time() - t
     timings.update({f"autofe_{k}": v for k, v in res.timings.items()})
     res.stage1.to_csv(os.path.join(a.out, "autofe_stage1.csv"), index=False)
@@ -153,21 +170,27 @@ def main():
     auto, timings["auto_features_s"] = block(res.selected)
     run("autofe", [auto, ctx])
     run("autofe+sess", [auto, ctx, sess], save_importance=True)
+    del auto, extra_tr, extra_va, tr_s, va_s
+    gc.collect()
 
     # equal feature budget: top-|manual| AutoFE features vs |manual| random grammar features
     by_name = {s.name: s for s in res.pool}
     n_man = len(man_specs)
     autoN, _ = block([by_name[f] for f in res.ranking[:n_man]])
     run("autofe_sameN+sess", [autoN, ctx, sess])
+    del autoN
     allspecs = [s for v in search_space().values() for s in v]
     rng = np.random.default_rng(a.seed)
     rnd, _ = block([allspecs[i] for i in rng.choice(len(allspecs), n_man, replace=False)])
     run("random_sameN+sess", [rnd, ctx, sess])
+    del rnd
 
     # union
     union_specs = list({s.name: s for s in man_specs + res.selected}.values())
     uni, _ = block(union_specs)
     run("manual∪autofe+sess", [uni, ctx, sess], save_importance=True)
+    del uni
+    gc.collect()
 
     # manual set with windows re-tuned by AutoFE stage 1 (same families, best time scale)
     s1 = res.stage1
@@ -181,6 +204,9 @@ def main():
     pd.Series([s.name for s in retuned]).to_csv(os.path.join(a.out, "manual_retuned.csv"), index=False)
     ret, _ = block(retuned)
     run("manual_retuned_windows+sess", [ret, ctx, sess])
+    timings["peak_rss_gb"] = rss_gb()
+    json.dump({"results": results, "timings": timings, "data": data_stats},
+              open(os.path.join(a.out, "results.json"), "w"), indent=1, default=float)
     log("done")
 
 

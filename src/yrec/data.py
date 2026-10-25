@@ -75,14 +75,15 @@ def load_raw_events(path: str, n_users: int | None = None, seed: int = 0) -> pd.
 
 def prepare_events(raw: pd.DataFrame, artist_map: pd.DataFrame | None = None,
                    album_map: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Memory-lean conversion (int32 ids, lookup arrays instead of DataFrame merges)."""
     ev = pd.DataFrame({
-        "uid": raw["uid"].astype("int64").to_numpy(),
-        "item_id": raw["item_id"].astype("int64").to_numpy(),
-        "ts": raw["timestamp"].astype("int64").to_numpy(),
+        "uid": raw["uid"].to_numpy().astype("int32"),
+        "item_id": raw["item_id"].to_numpy().astype("int32"),
+        "ts": raw["timestamp"].to_numpy().astype("int64"),
     })
-    ev["day"] = (ev["ts"] // TS_PER_DAY).astype("int16")
+    ev["day"] = (ev["ts"].to_numpy() // TS_PER_DAY).astype("int16")
     assert ev["day"].max() < 1024, f"unexpected time span: {ev['day'].max()} days (check timestamp units)"
-    ev["organic"] = raw["is_organic"].astype("int8").to_numpy()
+    ev["organic"] = raw["is_organic"].to_numpy().astype("int8")
     et = raw["event_type"]
     if isinstance(et.dtype, pd.CategoricalDtype):
         lut = np.array([EVENT_CODES[str(c)] for c in et.cat.categories], dtype="int8")
@@ -91,18 +92,22 @@ def prepare_events(raw: pd.DataFrame, artist_map: pd.DataFrame | None = None,
         ev["etype"] = np.asarray(et).astype("int8")
     else:
         ev["etype"] = pd.Series(np.asarray(et).astype(str)).map(EVENT_CODES).to_numpy().astype("int8")
-    ev["ratio"] = pd.to_numeric(raw["played_ratio_pct"], errors="coerce").astype("float32").to_numpy()
-    ev["tlen"] = pd.to_numeric(raw["track_length_seconds"], errors="coerce").astype("float32").to_numpy()
+    ev["ratio"] = pd.to_numeric(raw["played_ratio_pct"], errors="coerce").to_numpy(dtype="float32", na_value=np.nan)
+    ev["tlen"] = pd.to_numeric(raw["track_length_seconds"], errors="coerce").to_numpy(dtype="float32", na_value=np.nan)
+    items = ev["item_id"].to_numpy()
     for name, m in (("artist", artist_map), ("album", album_map)):
-        if m is not None:
-            ev = ev.merge(m, on="item_id", how="left")
-            ids = ev[f"{name}_id"]
-            # dense re-indexing keeps composite keys (uid << 24 | id) small; -1 = unknown
-            codes, _ = pd.factorize(ids, use_na_sentinel=True)
-            ev[f"{name}_id"] = codes.astype("int64")
-        else:
-            ev[f"{name}_id"] = np.int64(-1)
-    ev = ev.sort_values(["uid", "ts"], kind="stable").reset_index(drop=True)
+        if m is None:
+            ev[f"{name}_id"] = np.int32(-1)
+            continue
+        # keep only items present in the log, dense re-index ids (keeps composite keys small); -1 = unknown
+        m = m[m["item_id"].isin(np.unique(items))]
+        codes, _ = pd.factorize(m[f"{name}_id"])
+        lut = np.full(int(items.max()) + 1, -1, dtype="int32")
+        lut[m["item_id"].to_numpy()] = codes
+        ev[f"{name}_id"] = lut[items]
+    u, t = ev["uid"].to_numpy(), ev["ts"].to_numpy()
+    if not ((np.diff(u) > 0) | ((np.diff(u) == 0) & (np.diff(t) >= 0))).all():  # Yambda is pre-sorted
+        ev = ev.sort_values(["uid", "ts"], kind="stable").reset_index(drop=True)
     return ev
 
 
@@ -124,6 +129,7 @@ def load_yambda(data_dir: str | None = None, size: str = "50m", n_users: int | N
         paths = download_yambda(size)
     raw = load_raw_events(paths["events"], n_users=n_users, seed=seed)
     ev = prepare_events(raw, _read_mapping(paths["artist"], "artist"), _read_mapping(paths["album"], "album"))
+    del raw
     if cache:
         Path(cache).parent.mkdir(parents=True, exist_ok=True)
         ev.to_parquet(cache, index=False)
