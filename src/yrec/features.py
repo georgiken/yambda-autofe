@@ -268,7 +268,10 @@ class FeatureEngine:
         elif spec.kind == "drate":
             num = st.decay_sum(spec.stat, q, d, spec.half_life, M)
             den = st.decay_sum(spec.den, q, d, spec.half_life, M)
-            v = np.where(den > 0, num / np.where(den > 0, den, 1), np.nan)
+            # numerator events need not be a subset of the denominator (e.g. likes without listens in the log):
+            # require a non-negligible decayed denominator, otherwise the ratio explodes (num ~ 1, den ~ 2^-200)
+            ok = den > 1e-3
+            v = np.where(ok, num / np.where(ok, den, 1), np.nan)
         elif spec.kind == "share":
             par = self.stores[PARENT[spec.entity]]
             num = st.window_sum(spec.stat, q, d, spec.window, M)
@@ -281,7 +284,8 @@ class FeatureEngine:
             v = d - st.first_day(q, d, M)
         else:
             raise ValueError(spec.kind)
-        v = v.astype("float32")
+        with np.errstate(over="ignore", invalid="ignore"):
+            v = np.clip(v, -1e9, 1e9).astype("float32")  # safety: never feed inf to the learner
         if unknown.any():
             v[unknown] = np.nan
         return v

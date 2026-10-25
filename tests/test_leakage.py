@@ -56,7 +56,7 @@ def _naive(spec: FeatureSpec, ev: pd.DataFrame, row) -> float:
         return dsum(spec.stat, spec.half_life)
     if spec.kind == "drate":
         den = dsum(spec.den, spec.half_life)
-        return dsum(spec.stat, spec.half_life) / den if den > 0 else np.nan
+        return dsum(spec.stat, spec.half_life) / den if den > 1e-3 else np.nan
     if spec.kind == "share":
         par = {"user_item": "user", "user_artist": "user", "user_album": "user"}[spec.entity]
         pk = entity_key(pd.DataFrame([row]), par)[0]
