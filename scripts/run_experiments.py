@@ -20,7 +20,7 @@ from yrec.autofe import run_autofe  # noqa: E402
 from yrec.data import load_yambda, make_synthetic  # noqa: E402
 from yrec.feature_sets import manual_features, search_space  # noqa: E402
 from yrec.features import FeatureEngine, FeatureSpec, context_features, session_features  # noqa: E402
-from yrec.model import GBDT  # noqa: E402
+from yrec.model import GBDT, configure  # noqa: E402
 from yrec.protocol import evaluate, group_id, make_split, make_targets  # noqa: E402
 
 
@@ -42,8 +42,17 @@ def main():
     ap.add_argument("--autofe-train-rows", type=int, default=400_000)
     ap.add_argument("--autofe-val-rows", type=int, default=300_000)
     ap.add_argument("--skip-autofe", action="store_true")
+    ap.add_argument("--backend", default="auto", choices=["auto", "lgb", "xgb", "sk"])
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="cuda = train XGBoost on GPU")
+    ap.add_argument("--smoke", action="store_true",
+                    help="tiny real-data run (200 users, small samples) to check that everything works end-to-end")
     ap.add_argument("--out", default="results/run")
     a = ap.parse_args()
+    if a.smoke:
+        a.n_users = a.n_users or 200
+        a.max_train_rows, a.autofe_train_rows, a.autofe_val_rows = 50_000, 20_000, 20_000
+    backend, device = configure(a.backend, a.device)
+    log(f"GBDT backend={backend} device={device}")
     os.makedirs(a.out, exist_ok=True)
     timings, results = {}, {}
 
@@ -56,6 +65,7 @@ def main():
         ev = load_yambda(a.data_dir, a.size, a.n_users, a.seed,
                          cache=os.path.join(a.out, "..", f"events_{a.size}_{a.n_users or 'all'}_{a.seed}.parquet"))
     timings["load_s"] = time.time() - t
+    timings["backend"] = f"{backend}/{device}"
     sp = make_split(ev, a.n_train, a.n_val, a.n_test)
     log(f"events={len(ev):,} users={ev.uid.nunique():,} items={ev.item_id.nunique():,} days={ev.day.min()}..{ev.day.max()} split={sp.as_dict()}")
 
@@ -130,7 +140,8 @@ def main():
     extra_tr = pd.concat([context_features(tr_s), session_features(ev, tr_s)], axis=1)
     extra_va = pd.concat([context_features(va_s), session_features(ev, va_s)], axis=1)
     t = time.time()
-    res = run_autofe(eng, tr_s, va_s, extra_tr, extra_va)
+    res = run_autofe(eng, tr_s, va_s, extra_tr, extra_va,
+                     n_grid=(10, 30) if a.smoke else (10, 20, 30, 45, 60, 80, 100, 150))
     timings["autofe_search_s"] = time.time() - t
     timings.update({f"autofe_{k}": v for k, v in res.timings.items()})
     res.stage1.to_csv(os.path.join(a.out, "autofe_stage1.csv"), index=False)
