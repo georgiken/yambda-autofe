@@ -55,7 +55,7 @@ def event_stats(ev: pd.DataFrame) -> pd.DataFrame:
         "like": ev["etype"].to_numpy() == 1, "dislike": ev["etype"].to_numpy() == 2,
         "unlike": ev["etype"].to_numpy() == 3,
     }
-    return pd.DataFrame({k: np.asarray(v, dtype="float64") for k, v in out.items()})
+    return pd.DataFrame({k: np.asarray(v, dtype="float32") for k, v in out.items()})
 
 
 def entity_key(df: pd.DataFrame, entity: str) -> np.ndarray:
