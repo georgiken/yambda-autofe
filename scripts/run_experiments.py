@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from yrec.autofe import run_autofe  # noqa: E402
 from yrec.data import load_yambda, make_synthetic  # noqa: E402
 from yrec.feature_sets import manual_features, search_space  # noqa: E402
-from yrec.features import FeatureEngine, FeatureSpec, context_features, session_features  # noqa: E402
+from yrec.features import (FeatureEngine, FeatureSpec, context_features, session_family,  # noqa: E402
+                           session_features, session_grammar)
 from yrec.model import GBDT, configure  # noqa: E402
 from yrec.protocol import evaluate, group_id, make_split, make_targets  # noqa: E402
 
@@ -101,11 +102,21 @@ def main():
     sess = {k: session_features(ev, df) for k, df in (("tr", tr), ("va", va), ("te", te))}
     timings["session_s"] = time.time() - t
     # AutoFE samples need the raw log for session features -> build them now, then free the raw log
+    if not a.skip_autofe:
+        t = time.time()
+        sg = {k: session_grammar(ev, df) for k, df in (("tr", tr), ("va", va), ("te", te))}
+        fsel = os.path.join(a.autofe_from or "", "autofe_full_selected.csv")
+        if a.autofe_from and os.path.exists(fsel):  # keep only the transferred columns (memory)
+            keep = [c for c in pd.read_csv(fsel).iloc[:, 0] if c in sg["tr"].columns]
+            sg = {k: v[keep] for k, v in sg.items()}
+        timings["session_grammar_s"] = time.time() - t
     if not a.skip_autofe and not a.autofe_from:
         tr_s = make_targets(ev, sp.train_days, a.autofe_train_rows, seed=a.seed + 1)
         va_s = make_targets(ev, sp.val_days, a.autofe_val_rows, seed=a.seed + 1)
-        extra_tr = pd.concat([context_features(tr_s), session_features(ev, tr_s)], axis=1)
-        extra_va = pd.concat([context_features(va_s), session_features(ev, va_s)], axis=1)
+        ctx_s = (context_features(tr_s), context_features(va_s))
+        extra_tr = pd.concat([ctx_s[0], session_features(ev, tr_s)], axis=1)
+        extra_va = pd.concat([ctx_s[1], session_features(ev, va_s)], axis=1)
+        pre_s = (session_grammar(ev, tr_s), session_grammar(ev, va_s))
     del ev
     gc.collect()
     log("raw event log released")
@@ -169,6 +180,7 @@ def main():
         selected = [registry[n] for n in rd("autofe_selected.csv")]
         ranking = rd("autofe_ranking.csv")
         retuned = [registry[n] for n in rd("manual_retuned.csv")]
+        full_names = rd("autofe_full_selected.csv") if os.path.exists(os.path.join(src, "autofe_full_selected.csv")) else None
         timings["autofe_from"] = src
         log(f"AutoFE selection reused from {src}: {len(selected)} features (no search)")
     else:
@@ -193,7 +205,22 @@ def main():
             rt[b.name] = b
         retuned = list(rt.values())
         pd.Series([x.name for x in retuned]).to_csv(os.path.join(a.out, "manual_retuned.csv"), index=False)
-        del res, extra_tr, extra_va, tr_s, va_s
+        del res
+        # ---- AutoFE-full: aggregate grammar + SESSION grammar searched jointly, only context is fixed
+        eng.clear_cache()
+        t = time.time()
+        res2 = run_autofe(eng, tr_s, va_s, ctx_s[0], ctx_s[1], pre_tr=pre_s[0], pre_va=pre_s[1],
+                          pre_family=session_family,
+                          n_grid=(10, 30) if a.smoke else (10, 20, 30, 45, 60, 80, 100))
+        timings["autofe_full_search_s"] = time.time() - t
+        timings.update({f"autofe_full_{k}": v for k, v in res2.timings.items()})
+        res2.stage1.to_csv(os.path.join(a.out, "autofe_full_stage1.csv"), index=False)
+        res2.curve.to_csv(os.path.join(a.out, "autofe_full_curve.csv"), index=False)
+        pd.Series(res2.ranking).to_csv(os.path.join(a.out, "autofe_full_ranking.csv"), index=False)
+        full_names = [x.name for x in res2.selected]
+        pd.Series(full_names).to_csv(os.path.join(a.out, "autofe_full_selected.csv"), index=False)
+        log(f"AutoFE-full: {res2.timings}")
+        del res2, extra_tr, extra_va, tr_s, va_s, pre_s, ctx_s
         gc.collect()
         eng.clear_cache()
 
@@ -224,6 +251,20 @@ def main():
     run("manual_retuned_windows+sess", [ret, ctx, sess])
     del ret
     run("autofe+sess_lambdarank", [block(selected)[0], ctx, sess], params={"objective": "lambdarank"})
+    # ---- AutoFE-full (aggregates + session searched; no hand-written session features)
+    if full_names:
+        t = time.time()
+        agg_specs = [registry[n] for n in full_names if n in registry]
+        sg_cols = [n for n in full_names if n not in registry]
+        full_blk = block(agg_specs)[0] if agg_specs else {k: pd.DataFrame(index=df.index) for k, df in
+                                                           (("tr", tr), ("va", va), ("te", te))}
+        full_blk = {k: pd.concat([full_blk[k], sg[k][sg_cols]], axis=1) for k in full_blk}
+        timings["autofe_full_features_s"] = time.time() - t
+        log(f"AutoFE-full set: {len(agg_specs)} aggregate + {len(sg_cols)} session features")
+        run("autofe_full", [full_blk, ctx], save_importance=True)
+        run("autofe_full+sess", [full_blk, ctx, sess])
+        run("autofe_full_lambdarank", [full_blk, ctx], params={"objective": "lambdarank"})
+        del full_blk
     timings["peak_rss_gb"] = rss_gb()
     json.dump({"results": results, "timings": timings, "data": data_stats},
               open(os.path.join(a.out, "results.json"), "w"), indent=1, default=float)

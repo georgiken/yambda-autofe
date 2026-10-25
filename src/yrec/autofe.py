@@ -63,20 +63,42 @@ class AutoFEResult:
     timings: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class Precomputed:
+    """A candidate whose values are given as a precomputed column (e.g. session grammar)."""
+    name: str
+    family: str
+    kind: str = "session"
+    entity: str = "session"
+    window: int | None = None
+    half_life: float | None = None
+
+
 def run_autofe(engine: FeatureEngine, tr: pd.DataFrame, va: pd.DataFrame, extra_tr: pd.DataFrame | None = None,
                extra_va: pd.DataFrame | None = None, k_per_family: int = 2, max_corr: float = 0.97,
                n_grid=(10, 20, 30, 45, 60, 80, 100), fixed_n: int | None = None, max_n: int = 100,
-               gbdt_params: dict | None = None, verbose: bool = True) -> AutoFEResult:
+               gbdt_params: dict | None = None, verbose: bool = True,
+               pre_tr: pd.DataFrame | None = None, pre_va: pd.DataFrame | None = None,
+               pre_family=None) -> AutoFEResult:
     """tr/va: target frames (with 'label'); extra_*: fixed feature blocks always included in stage 2
-    (e.g. context / session), so AutoFE selects features that add value on top of them."""
+    (e.g. context / session), so AutoFE selects features that add value on top of them.
+    pre_tr/pre_va: extra candidate columns (e.g. session grammar) searched together with the aggregate
+    grammar; pre_family(name) -> (family, k) groups them into families."""
     t0 = time.time()
-    fam = search_space()
+    fam = {f: [(s, None) for s in v] for f, v in search_space().items()}
+    if pre_tr is not None:
+        for c in pre_tr.columns:
+            f, k = pre_family(c)
+            fam.setdefault(f, []).append((Precomputed(c, f, window=k), c))
     ytr, yva = tr["label"].to_numpy().astype(float), va["label"].to_numpy().astype(float)
     rows, pool, cache_tr, cache_va = [], [], {}, {}
     for i, (fname, specs) in enumerate(fam.items()):
         scored = []
-        for s in specs:
-            xtr, xva = engine.compute(s, tr), engine.compute(s, va)
+        for s, col in specs:
+            if col is None:
+                xtr, xva = engine.compute(s, tr), engine.compute(s, va)
+            else:
+                xtr, xva = pre_tr[col].to_numpy(), pre_va[col].to_numpy()
             g = univariate_gain(xtr.astype("float64"), ytr, xva.astype("float64"), yva)
             rows.append({"family": fname, "feature": s.name, "kind": s.kind, "entity": s.entity,
                          "window": s.window, "half_life": s.half_life, "gain": g})

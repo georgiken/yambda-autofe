@@ -47,8 +47,8 @@ def manual_features() -> list[F]:
 
 
 # --------------------------------------------------------------------------- AutoFE search space
-WINDOWS = (1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60, 90, 120, None)
-HALF_LIVES = (1, 3, 7, 14, 30, 90)
+WINDOWS = (1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60, 90, 120, 180, None)
+HALF_LIVES = (1, 3, 7, 14, 30, 90, 180, 365)
 CNT_STATS = ("listen", "listen_org", "listen_rec", "full", "full_rec", "early_skip", "ratio_sum", "like", "dislike")
 RATES = (("full", "listen"), ("full_rec", "listen_rec"), ("early_skip", "listen"), ("like", "listen"),
          ("dislike", "listen"), ("ratio_sum", "listen"), ("listen_org", "listen"))

@@ -16,7 +16,8 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from yrec.data import make_synthetic  # noqa: E402
 from yrec.feature_sets import manual_features, search_space  # noqa: E402
-from yrec.features import FeatureEngine, FeatureSpec, event_stats, session_features, entity_key  # noqa: E402
+from yrec.features import (FeatureEngine, FeatureSpec, entity_key, event_stats, session_features,  # noqa: E402
+                           session_grammar)
 from yrec.protocol import make_split, make_targets  # noqa: E402
 
 EV = make_synthetic(n_users=60, n_items=400, n_artists=40, n_days=70, events_per_user_day=8, seed=1)
@@ -107,6 +108,7 @@ def test_session_no_future():
     sp = make_split(EV, n_train=10, n_val=5, n_test=5)
     tgt = make_targets(EV, sp.test_days)
     full = session_features(EV, tgt)
+    full_g = session_grammar(EV, tgt)
     rng = np.random.default_rng(0)
     for i in rng.choice(len(tgt), 40, replace=False):
         r = tgt.iloc[i]
@@ -116,6 +118,8 @@ def test_session_no_future():
         one = session_features(ev_cut, tgt.iloc[[i]])
         a, b = full.iloc[i].to_numpy(), one.iloc[0].to_numpy()
         assert np.allclose(a, b, equal_nan=True), (i, a, b)
+        g1, g2 = full_g.iloc[i].to_numpy(), session_grammar(ev_cut, tgt.iloc[[i]]).iloc[0].to_numpy()
+        assert np.allclose(g1, g2, equal_nan=True), (i, full_g.columns[~np.isclose(g1, g2, equal_nan=True)])
 
 
 def test_split_order():

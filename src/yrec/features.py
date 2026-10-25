@@ -351,3 +351,91 @@ def session_features(ev: pd.DataFrame, tgt: pd.DataFrame) -> pd.DataFrame:
                                               (t["prev_artist"] == t["artist_id"]).astype(float)),
         }, index=tgt.index).astype("float32")
     return out
+
+
+# --------------------------------------------------------------------------- session grammar (AutoFE over sessions)
+SESSION_KS = (1, 2, 3, 5, 10, 20, 50)
+_SG_STATS = ("full", "ratio", "esk", "org")
+
+
+def session_grammar(ev: pd.DataFrame, tgt: pd.DataFrame, ks=SESSION_KS) -> pd.DataFrame:
+    """Candidate session features for AutoFE, computed from the user's LISTEN events with timestamp
+    STRICTLY earlier than the target (same leakage rules as `session_features`: no likes, no time gaps).
+
+    sg__{scope}__{stat}__k{k}  mean of stat over the last k listens; scope = day (same day only) | any
+                               stat: full (>=50%), ratio (played share), esk (<10%), org (organic share),
+                               frec (full rate among recommended listens), n (number of listens, day only)
+    sp__{artist|item}__gap     listens since the last listen of the same artist / track (any day)
+    sp__{..}__day_cnt|day_full listens of the same artist / track earlier today and their full rate
+    sp__{..}__any_cnt|any_full the same over the whole history up to now
+    """
+    lis = ev.loc[ev["etype"].to_numpy() == 0, ["uid", "ts", "item_id", "artist_id", "organic", "ratio"]]
+    u = lis["uid"].to_numpy().astype(np.int64)
+    t = lis["ts"].to_numpy().astype(np.int64)
+    S40 = np.int64(1 << 40)
+    comp = u * S40 + t
+    if not np.all(comp[1:] >= comp[:-1]):
+        o = np.argsort(comp, kind="stable")
+        lis, u, t, comp = lis.iloc[o], u[o], t[o], comp[o]
+    r = np.nan_to_num(lis["ratio"].to_numpy(dtype="float64"))
+    org = lis["organic"].to_numpy() == 1
+    x = {"full": r >= 50, "ratio": np.clip(r, 0, 100) / 100, "esk": r < 10, "org": org,
+         "rec": ~org, "frec": (r >= 50) & ~org}
+    C = {k: np.concatenate([[0.0], np.cumsum(v, dtype="float64")]) for k, v in x.items()}
+
+    qu = tgt["uid"].to_numpy().astype(np.int64)
+    qt = tgt["ts"].to_numpy().astype(np.int64)
+    qd = tgt["day"].to_numpy().astype(np.int64)
+    p = np.searchsorted(comp, qu * S40 + qt, side="left")          # listens strictly before target
+    ustart = np.searchsorted(comp, qu * S40, side="left")
+    dstart = np.searchsorted(comp, qu * S40 + qd * 86400, side="left")
+    out = {}
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for scope, lo0 in (("day", dstart), ("any", ustart)):
+            for k in tuple(ks) + ((None,) if scope == "day" else ()):
+                lo = lo0 if k is None else np.maximum(lo0, p - k)
+                n = (p - lo).astype("float64")
+                kk = "all" if k is None else k
+                for st in _SG_STATS:
+                    out[f"sg__{scope}__{st}__k{kk}"] = np.where(n > 0, (C[st][p] - C[st][lo]) / n, np.nan)
+                nrec = C["rec"][p] - C["rec"][lo]
+                out[f"sg__{scope}__frec__k{kk}"] = np.where(nrec > 0, (C["frec"][p] - C["frec"][lo]) / nrec, np.nan)
+        out["sg__day__n__kall"] = (p - dstart).astype("float64")
+
+        # same artist / same track: order listens by (pair, ts)
+        gpos = np.arange(len(lis))
+        for key, col in (("artist", "artist_id"), ("item", "item_id")):
+            kv = lis[col].to_numpy().astype(np.int64)
+            pk = u * np.int64(1 << 24) + kv
+            uniq, pid = np.unique(pk, return_inverse=True)
+            S35 = np.int64(1 << 35)
+            c2 = pid.astype(np.int64) * S35 + t
+            o2 = np.argsort(c2, kind="stable")
+            c2, g2 = c2[o2], gpos[o2]
+            f2 = np.concatenate([[0.0], np.cumsum(x["full"][o2], dtype="float64")])
+            qk = tgt[col].to_numpy().astype(np.int64)
+            qpk = qu * np.int64(1 << 24) + qk
+            qi = np.searchsorted(uniq, qpk)
+            found = (qi < len(uniq)) & (uniq[np.minimum(qi, len(uniq) - 1)] == qpk) & (qk >= 0)
+            qpid = np.where(found, qi, 0).astype(np.int64)
+            q = np.searchsorted(c2, qpid * S35 + qt, side="left")
+            ps = np.searchsorted(c2, qpid * S35, side="left")
+            ds = np.searchsorted(c2, qpid * S35 + qd * 86400, side="left")
+            nb = np.where(found, q - ps, 0).astype("float64")
+            nd = np.where(found, q - ds, 0).astype("float64")
+            last_g = g2[np.maximum(q - 1, 0)]
+            out[f"sp__{key}__gap"] = np.where(nb > 0, p - 1 - last_g, np.nan)
+            out[f"sp__{key}__day_cnt"] = nd
+            out[f"sp__{key}__day_full"] = np.where(nd > 0, (f2[q] - f2[np.where(found, ds, q)]) / np.maximum(nd, 1), np.nan)
+            out[f"sp__{key}__any_cnt"] = nb
+            out[f"sp__{key}__any_full"] = np.where(nb > 0, (f2[q] - f2[np.where(found, ps, q)]) / np.maximum(nb, 1), np.nan)
+    return pd.DataFrame(out, index=tgt.index).astype("float32")
+
+
+def session_family(name: str):
+    """Family and scale of a session-grammar column (scale = k for sg__, None otherwise)."""
+    parts = name.split("__")
+    if parts[0] == "sg":
+        k = parts[3][1:]
+        return f"sg__{parts[1]}__{parts[2]}", (None if k == "all" else int(k))
+    return name, None

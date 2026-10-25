@@ -15,7 +15,8 @@ os.makedirs(OUT, exist_ok=True)
 
 ORDER = ["pop_item_fullrate", "user_fullrate", "ctx_only", "manual", "autofe", "manual+sess",
          "random_sameN+sess", "manual_retuned_windows+sess", "autofe+sess", "autofe_sameN+sess",
-         "manual∪autofe+sess", "manual+sess_lambdarank", "autofe+sess_lambdarank"]
+         "manual∪autofe+sess", "autofe_full", "autofe_full+sess", "manual+sess_lambdarank", "autofe+sess_lambdarank",
+         "autofe_full_lambdarank"]
 
 
 def table(run_dir: str) -> pd.DataFrame:
@@ -88,7 +89,7 @@ for run_dir in sorted(glob.glob(os.path.join(ROOT, "*/"))):
             md.append(best.sort_values("gain", ascending=False).head(25)[["family", "feature", "gain"]]
                       .to_markdown(index=False, floatfmt=".5f") + "\n")
             md.append("Распределение лучших масштабов: " + json.dumps(best["scale"].value_counts().to_dict()) + "\n")
-        for imp in ("manual+sess", "autofe+sess"):
+        for imp in ("manual+sess", "autofe+sess", "autofe_full"):
             ip = os.path.join(run_dir, f"importance_{imp}.csv")
             if os.path.exists(ip):
                 im = pd.read_csv(ip, index_col=0).iloc[:, 0]
