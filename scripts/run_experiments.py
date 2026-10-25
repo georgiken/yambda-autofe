@@ -92,10 +92,6 @@ def main():
                   "share_rec_listens": float(((ev.etype == 0) & (ev.organic == 0)).sum() / (ev.etype == 0).sum())}
 
     # ------------------------------------------------------------------ engine + fixed blocks
-    t = time.time()
-    eng = FeatureEngine(ev)
-    timings["engine_build_s"] = time.time() - t
-    log(f"engine built in {timings['engine_build_s']:.1f}s")
 
     t = time.time()
     ctx = {k: context_features(df) for k, df in (("tr", tr), ("va", va), ("te", te))}
@@ -117,6 +113,13 @@ def main():
         extra_tr = pd.concat([ctx_s[0], session_features(ev, tr_s)], axis=1)
         extra_va = pd.concat([ctx_s[1], session_features(ev, va_s)], axis=1)
         pre_s = (session_grammar(ev, tr_s), session_grammar(ev, va_s))
+    gc.collect()
+    # build the aggregate engine last: session features above need only the raw log, so peak memory is
+    # max(raw log + session grammar, raw log + engine) instead of their sum
+    t = time.time()
+    eng = FeatureEngine(ev)
+    timings["engine_build_s"] = time.time() - t
+    log(f"engine built in {timings['engine_build_s']:.1f}s")
     del ev
     gc.collect()
     log("raw event log released")
