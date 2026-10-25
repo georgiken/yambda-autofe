@@ -13,9 +13,9 @@ ROOT = sys.argv[1] if len(sys.argv) > 1 else "results"
 OUT = os.path.join(ROOT, "report")
 os.makedirs(OUT, exist_ok=True)
 
-ORDER = ["pop_item_fullrate", "user_fullrate", "ctx_only", "manual", "manual+sess", "manual+sess_lambdarank",
-         "manual_retuned_windows+sess", "random_sameN+sess", "autofe", "autofe+sess", "autofe_sameN+sess",
-         "manual∪autofe+sess"]
+ORDER = ["pop_item_fullrate", "user_fullrate", "ctx_only", "manual", "autofe", "manual+sess",
+         "random_sameN+sess", "manual_retuned_windows+sess", "autofe+sess", "autofe_sameN+sess",
+         "manual∪autofe+sess", "manual+sess_lambdarank", "autofe+sess_lambdarank"]
 
 
 def table(run_dir: str) -> pd.DataFrame:
@@ -44,6 +44,12 @@ for run_dir in sorted(glob.glob(os.path.join(ROOT, "*/"))):
     md.append("timings (s): " + json.dumps({k: round(v, 1) for k, v in r["timings"].items()
                                            if isinstance(v, (int, float))}) + "\n")
     md.append(df.to_markdown(index=False, floatfmt=".4f") + "\n")
+    bpath = os.path.join(run_dir, "bootstrap.csv")
+    if os.path.exists(bpath):
+        b = pd.read_csv(bpath)
+        b["diff [95% CI]"] = b.apply(lambda r: f"{r.diff_vs_ref:+.4f} [{r.ci_low:+.4f}, {r.ci_high:+.4f}]", axis=1)
+        md.append("Paired bootstrap по пользователям, разница с manual+sess (test):\n")
+        md.append(b.pivot(index="model", columns="metric", values="diff [95% CI]").to_markdown() + "\n")
     # figures
     try:
         import matplotlib

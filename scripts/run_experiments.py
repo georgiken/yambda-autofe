@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--autofe-train-rows", type=int, default=400_000)
     ap.add_argument("--autofe-val-rows", type=int, default=300_000)
     ap.add_argument("--skip-autofe", action="store_true")
+    ap.add_argument("--autofe-from", default=None,
+                    help="reuse AutoFE selection from another run dir (e.g. found on 1000 users) instead of searching")
     ap.add_argument("--backend", default="auto", choices=["auto", "lgb", "xgb", "sk"])
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="cuda = train XGBoost on GPU")
     ap.add_argument("--smoke", action="store_true",
@@ -63,7 +65,7 @@ def main():
     backend, device = configure(a.backend, a.device)
     log(f"GBDT backend={backend} device={device}")
     os.makedirs(a.out, exist_ok=True)
-    timings, results = {}, {}
+    timings, results, preds = {}, {}, {}
 
     # ------------------------------------------------------------------ data
     t = time.time()
@@ -99,7 +101,7 @@ def main():
     sess = {k: session_features(ev, df) for k, df in (("tr", tr), ("va", va), ("te", te))}
     timings["session_s"] = time.time() - t
     # AutoFE samples need the raw log for session features -> build them now, then free the raw log
-    if not a.skip_autofe:
+    if not a.skip_autofe and not a.autofe_from:
         tr_s = make_targets(ev, sp.train_days, a.autofe_train_rows, seed=a.seed + 1)
         va_s = make_targets(ev, sp.val_days, a.autofe_val_rows, seed=a.seed + 1)
         extra_tr = pd.concat([context_features(tr_s), session_features(ev, tr_s)], axis=1)
@@ -117,10 +119,14 @@ def main():
     def run(name, blocks, params=None, save_importance=False):
         Xs = {k: pd.concat([b[k] for b in blocks], axis=1) for k in ("tr", "va", "te")}
         m = GBDT(params).fit(Xs["tr"], tr.label.values, Xs["va"], va.label.values, group_id(tr), group_id(va))
+        p_te = m.predict(Xs["te"])
         r = {"n_features": Xs["tr"].shape[1], "fit_s": m.fit_time, "best_iter": m.best_iter,
              "val": evaluate(va.label.values, m.predict(Xs["va"]), group_id(va)),
-             "test": evaluate(te.label.values, m.predict(Xs["te"]), group_id(te))}
+             "test": evaluate(te.label.values, p_te, group_id(te))}
         results[name] = r
+        preds[name] = p_te.astype("float32")
+        np.savez_compressed(os.path.join(a.out, "preds_test.npz"), y=te.label.values, uid=te.uid.values,
+                            group=group_id(te), **preds)
         log(f"[{name}] nf={r['n_features']} val ll={r['val']['logloss']:.4f} auc={r['val']['auc']:.4f} "
             f"ndcg={r['val']['ndcg@10']:.4f} | test ll={r['test']['logloss']:.4f} auc={r['test']['auc']:.4f} "
             f"gauc={r['test']['gauc']:.4f} ndcg={r['test']['ndcg@10']:.4f}")
@@ -155,55 +161,69 @@ def main():
         return
 
     # ------------------------------------------------------------------ AutoFE (search on train/val samples only)
-    eng.clear_cache()
-    t = time.time()
-    res = run_autofe(eng, tr_s, va_s, extra_tr, extra_va,
-                     n_grid=(10, 30) if a.smoke else (10, 20, 30, 45, 60, 80, 100))
-    timings["autofe_search_s"] = time.time() - t
-    timings.update({f"autofe_{k}": v for k, v in res.timings.items()})
-    res.stage1.to_csv(os.path.join(a.out, "autofe_stage1.csv"), index=False)
-    res.curve.to_csv(os.path.join(a.out, "autofe_curve.csv"), index=False)
-    pd.Series(res.ranking).to_csv(os.path.join(a.out, "autofe_ranking.csv"), index=False)
-    pd.Series([s.name for s in res.selected]).to_csv(os.path.join(a.out, "autofe_selected.csv"), index=False)
-    log(f"AutoFE: {res.timings}")
+    registry = {x.name: x for v in search_space().values() for x in v}
+    registry.update({x.name: x for x in man_specs})
+    if a.autofe_from:
+        src = a.autofe_from
+        rd = lambda f: list(pd.read_csv(os.path.join(src, f)).iloc[:, 0])  # noqa: E731
+        selected = [registry[n] for n in rd("autofe_selected.csv")]
+        ranking = rd("autofe_ranking.csv")
+        retuned = [registry[n] for n in rd("manual_retuned.csv")]
+        timings["autofe_from"] = src
+        log(f"AutoFE selection reused from {src}: {len(selected)} features (no search)")
+    else:
+        eng.clear_cache()
+        t = time.time()
+        res = run_autofe(eng, tr_s, va_s, extra_tr, extra_va,
+                         n_grid=(10, 30) if a.smoke else (10, 20, 30, 45, 60, 80, 100))
+        timings["autofe_search_s"] = time.time() - t
+        timings.update({f"autofe_{k}": v for k, v in res.timings.items()})
+        res.stage1.to_csv(os.path.join(a.out, "autofe_stage1.csv"), index=False)
+        res.curve.to_csv(os.path.join(a.out, "autofe_curve.csv"), index=False)
+        pd.Series(res.ranking).to_csv(os.path.join(a.out, "autofe_ranking.csv"), index=False)
+        pd.Series([x.name for x in res.selected]).to_csv(os.path.join(a.out, "autofe_selected.csv"), index=False)
+        log(f"AutoFE: {res.timings}")
+        selected, ranking = res.selected, res.ranking
+        # manual set with windows re-tuned by AutoFE stage 1 (same families, best time scale)
+        s1 = res.stage1
+        best_scale = s1.loc[s1.groupby("family")["gain"].idxmax()].set_index("family")["feature"].to_dict()
+        rt = {}
+        for x in man_specs:
+            b = registry.get(best_scale.get(x.family, ""), x)
+            rt[b.name] = b
+        retuned = list(rt.values())
+        pd.Series([x.name for x in retuned]).to_csv(os.path.join(a.out, "manual_retuned.csv"), index=False)
+        del res, extra_tr, extra_va, tr_s, va_s
+        gc.collect()
+        eng.clear_cache()
 
-    auto, timings["auto_features_s"] = block(res.selected)
+    auto, timings["auto_features_s"] = block(selected)
     run("autofe", [auto, ctx])
     run("autofe+sess", [auto, ctx, sess], save_importance=True)
-    del auto, extra_tr, extra_va, tr_s, va_s
+    del auto
     gc.collect()
 
     # equal feature budget: top-|manual| AutoFE features vs |manual| random grammar features
-    by_name = {s.name: s for s in res.pool}
     n_man = len(man_specs)
-    autoN, _ = block([by_name[f] for f in res.ranking[:n_man]])
+    autoN, _ = block([registry[f] for f in ranking[:n_man]])
     run("autofe_sameN+sess", [autoN, ctx, sess])
     del autoN
-    allspecs = [s for v in search_space().values() for s in v]
+    allspecs = [x for v in search_space().values() for x in v]
     rng = np.random.default_rng(a.seed)
     rnd, _ = block([allspecs[i] for i in rng.choice(len(allspecs), n_man, replace=False)])
     run("random_sameN+sess", [rnd, ctx, sess])
     del rnd
 
-    # union
-    union_specs = list({s.name: s for s in man_specs + res.selected}.values())
+    union_specs = list({x.name: x for x in man_specs + selected}.values())
     uni, _ = block(union_specs)
     run("manual∪autofe+sess", [uni, ctx, sess], save_importance=True)
     del uni
     gc.collect()
 
-    # manual set with windows re-tuned by AutoFE stage 1 (same families, best time scale)
-    s1 = res.stage1
-    best_scale = s1.loc[s1.groupby("family")["gain"].idxmax()].set_index("family")["feature"].to_dict()
-    fam_specs = {s.name: s for v in search_space().values() for s in v}
-    retuned = {}
-    for s in man_specs:
-        b = fam_specs.get(best_scale.get(s.family, ""), s)
-        retuned[b.name] = b
-    retuned = list(retuned.values())
-    pd.Series([s.name for s in retuned]).to_csv(os.path.join(a.out, "manual_retuned.csv"), index=False)
     ret, _ = block(retuned)
     run("manual_retuned_windows+sess", [ret, ctx, sess])
+    del ret
+    run("autofe+sess_lambdarank", [block(selected)[0], ctx, sess], params={"objective": "lambdarank"})
     timings["peak_rss_gb"] = rss_gb()
     json.dump({"results": results, "timings": timings, "data": data_stats},
               open(os.path.join(a.out, "results.json"), "w"), indent=1, default=float)
