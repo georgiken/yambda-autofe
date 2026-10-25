@@ -6,3 +6,6 @@ results/events_*.parquet
 results/synthetic/
 data/
 *.tar.gz
+results_smoke/
+.venv/
+yambda-autofe.zip
